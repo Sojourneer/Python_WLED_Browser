@@ -67,6 +67,8 @@ def scan_wled_devices():
         zeroconf.close()
 
     services_list = list(listener.services.values())
+    # Sort by friendly_name (instance name) as default
+    services_list.sort(key=lambda s: s['friendly_name'].lower())
     return services_list
 
 
@@ -177,6 +179,52 @@ def set_sync_groups(service, send_mask, recv_mask):
         return False
 
 
+def get_status(service):
+    """
+    Get the full JSON status from a WLED device.
+    
+    Args:
+        service: The service dict containing host_ip and port
+    
+    Returns:
+        JSON dict if successful, None otherwise
+    """
+    url = f"http://{service['host_ip']}:{service['port']}/json/state"
+    try:
+        response = requests.get(url, timeout=2)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
+            return None
+    except Exception as e:
+        print(f"  {service['friendly_name']}: Error - {e}")
+        return None
+
+
+def get_nested_field(data, field_path):
+    """
+    Extract a nested field from a dictionary using dot notation.
+    
+    Args:
+        data: The dictionary to extract from
+        field_path: Dot-separated path (e.g., 'udpn.send')
+    
+    Returns:
+        The value at the field path, or None if not found
+    """
+    parts = field_path.split('.')
+    current = data
+    
+    for part in parts:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return None
+    
+    return current
+
+
 def set_power(service, state):
     """
     Turn a WLED device on or off and update cached state.
@@ -203,15 +251,19 @@ def set_power(service, state):
 
 def parse_range(range_str, max_index):
     """
-    Parse a range string like '3', '1-5', or '0,2-4,7' into a list of indices.
+    Parse a range string like '3', '1-5', '0,2-4,7', or 'all' into a list of indices.
     
     Args:
-        range_str: String like '3', '1-5', or '0,2-4,7' (comma-separated ranges/singles)
+        range_str: String like '3', '1-5', '0,2-4,7', or 'all' (comma-separated ranges/singles)
         max_index: Maximum valid index (exclusive)
     
     Returns:
         List of valid indices (deduplicated and sorted), or None if invalid
     """
+    # Handle 'all' keyword
+    if range_str.strip().lower() == 'all':
+        return list(range(max_index))
+    
     try:
         indices = []
         
@@ -350,6 +402,11 @@ def command_loop():
                 print("Device Management:")
                 print("  id <range>       : Identify devices one-by-one")
                 print("                     (n=next, p=prev, e=exit)")
+                print("  status <range>   : Refresh power state display")
+                print("  info <range> [fields]")
+                print("                   : Get and display JSON status")
+                print("                     Optional fields: CSV list with dot notation")
+                print("                     Example: info 0 on,bri,udpn.send")
                 print("  ui <nn>          : Launch WLED UI in browser")
                 print("  scan             : Rescan network for WLED devices")
                 print("  list             : Refresh device list display")
@@ -362,6 +419,7 @@ def command_loop():
                 print("  <nn>             : Single device (e.g., 0)")
                 print("  <nn>-<mm>        : Range of devices (e.g., 1-3)")
                 print("  <nn>,<mm>,...    : Multiple devices/ranges (e.g., 0,2-4,7)")
+                print("  all              : All devices")
                 print()
                 print("Sync Groups:")
                 print("  1-8              : Group numbers (e.g., 1,3,5)")
@@ -496,6 +554,71 @@ def command_loop():
                 
                 clear_screen()
                 display_services(services_list)
+            
+            elif cmd == 'status':
+                if len(parts) < 2:
+                    print("Usage: status <nn>[-<mm>]")
+                    continue
+                
+                if not services_list:
+                    print("No devices found. Run 'scan' first.")
+                    continue
+                
+                indices = parse_range(parts[1], len(services_list))
+                if indices is None:
+                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    continue
+                
+                # Refresh power state from devices
+                for idx in indices:
+                    service = services_list[idx]
+                    status = get_status(service)
+                    if status:
+                        service['power_state'] = status.get('on', None)
+                
+                clear_screen()
+                display_services(services_list)
+            
+            elif cmd == 'info':
+                if len(parts) < 2:
+                    print("Usage: info <nn>[-<mm>] [fields]")
+                    print("Example: info 0 on,bri,udpn.send")
+                    continue
+                
+                if not services_list:
+                    print("No devices found. Run 'scan' first.")
+                    continue
+                
+                # Parse: info <range> [fields]
+                info_parts = parts[1].split(maxsplit=1)
+                range_spec = info_parts[0]
+                fields_str = info_parts[1] if len(info_parts) > 1 else None
+                
+                indices = parse_range(range_spec, len(services_list))
+                if indices is None:
+                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    continue
+                
+                import json
+                
+                # Parse field list if provided
+                fields = None
+                if fields_str:
+                    fields = [f.strip() for f in fields_str.split(',')]
+                
+                for idx in indices:
+                    service = services_list[idx]
+                    print(f"\n--- Info for {idx}. {service['friendly_name']} ---")
+                    status = get_status(service)
+                    if status:
+                        if fields:
+                            # Display only requested fields
+                            for field in fields:
+                                value = get_nested_field(status, field)
+                                print(f"  {field}: {json.dumps(value)}")
+                        else:
+                            # Display full JSON
+                            print(json.dumps(status, indent=2))
             
             elif cmd == 'ui':
                 if len(parts) < 2:
