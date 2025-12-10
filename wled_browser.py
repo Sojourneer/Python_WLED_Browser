@@ -45,13 +45,17 @@ class WLEDListener(ServiceListener):
     update_service = add_service 
 
 
-def scan_wled_devices():
+def scan_wled_devices(discovery_time_seconds=10):
     """
     Scan for WLED devices on the network.
-    Returns a list of discovered services.
+    
+    Args:
+        discovery_time_seconds: Time to scan for devices (default: 10)
+    
+    Returns:
+        List of discovered services.
     """
     service_type = "_wled._tcp.local."
-    discovery_time_seconds = 10
 
     zeroconf = Zeroconf()
     listener = WLEDListener()
@@ -408,7 +412,8 @@ def command_loop():
                 print("                     Optional fields: CSV list with dot notation")
                 print("                     Example: info 0 on,bri,udpn.send")
                 print("  ui <nn>          : Launch WLED UI in browser")
-                print("  scan             : Rescan network for WLED devices")
+                print("  scan [seconds]   : Rescan network for WLED devices")
+                print("                     Default: 10 seconds")
                 print("  list             : Refresh device list display")
                 print()
                 print("General:")
@@ -427,7 +432,18 @@ def command_loop():
                 print("=" * 50)
             
             elif cmd == 'scan':
-                services_list = scan_wled_devices()
+                scan_time = 10  # Default
+                if len(parts) > 1:
+                    try:
+                        scan_time = int(parts[1])
+                        if scan_time < 1:
+                            print("Scan time must be at least 1 second.")
+                            continue
+                    except ValueError:
+                        print("Invalid scan time. Using default of 10 seconds.")
+                        scan_time = 10
+                
+                services_list = scan_wled_devices(scan_time)
                 clear_screen()
                 display_services(services_list)
             
