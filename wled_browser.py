@@ -208,23 +208,44 @@ def get_status(service):
 
 def get_nested_field(data, field_path):
     """
-    Extract a nested field from a dictionary using dot notation.
+    Extract a nested field from a dictionary/list using dot notation and bracket indexing.
     
     Args:
-        data: The dictionary to extract from
-        field_path: Dot-separated path (e.g., 'udpn.send')
+        data: The dictionary/list to extract from
+        field_path: Path with dots and brackets (e.g., 'seg[0].bri', 'udpn.send')
     
     Returns:
         The value at the field path, or None if not found
     """
+    import re
+    
+    # Split by dots, but keep bracket notation intact
     parts = field_path.split('.')
     current = data
     
     for part in parts:
-        if isinstance(current, dict) and part in current:
-            current = current[part]
+        # Check if this part has bracket notation (e.g., 'seg[0]')
+        match = re.match(r'^([^\[]+)\[(\d+)\]$', part)
+        
+        if match:
+            # Handle array indexing: 'seg[0]'
+            key = match.group(1)
+            index = int(match.group(2))
+            
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+                if isinstance(current, list) and 0 <= index < len(current):
+                    current = current[index]
+                else:
+                    return None
+            else:
+                return None
         else:
-            return None
+            # Handle regular dictionary access
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return None
     
     return current
 
@@ -409,8 +430,8 @@ def command_loop():
                 print("  status <range>   : Refresh power state display")
                 print("  info <range> [fields]")
                 print("                   : Get and display JSON status")
-                print("                     Optional fields: CSV list with dot notation")
-                print("                     Example: info 0 on,bri,udpn.send")
+                print("                     Optional fields: CSV list with dot/bracket notation")
+                print("                     Example: info 0 on,bri,seg[0].bri,udpn.send")
                 print("  ui <nn>          : Launch WLED UI in browser")
                 print("  scan [seconds]   : Rescan network for WLED devices")
                 print("                     Default: 10 seconds")
