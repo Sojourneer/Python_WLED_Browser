@@ -35,6 +35,7 @@ class WLEDListener(ServiceListener):
                 'host_ip': address,
                 'port': info.port,
                 'friendly_name': friendly_name,
+                'group': '_default',  # Group identifier
                 'power_state': None,  # Cache for power state
                 'sync_enabled': None, # Cache for UDP sync on/off
                 'sync_send': None,    # Cache for sync send groups (bitmask)
@@ -45,12 +46,13 @@ class WLEDListener(ServiceListener):
     update_service = add_service 
 
 
-def scan_wled_devices(discovery_time_seconds=10):
+def scan_wled_devices(discovery_time_seconds=10, existing_services=None):
     """
     Scan for WLED devices on the network.
     
     Args:
         discovery_time_seconds: Time to scan for devices (default: 10)
+        existing_services: Existing services list to preserve group assignments
     
     Returns:
         List of discovered services.
@@ -71,21 +73,40 @@ def scan_wled_devices(discovery_time_seconds=10):
         zeroconf.close()
 
     services_list = list(listener.services.values())
-    # Sort by friendly_name (instance name) as default
-    services_list.sort(key=lambda s: s['friendly_name'].lower())
+    
+    # Preserve group assignments from existing services
+    if existing_services:
+        existing_groups = {s['host_ip']: s['group'] for s in existing_services}
+        for service in services_list:
+            if service['host_ip'] in existing_groups:
+                service['group'] = existing_groups[service['host_ip']]
+    
+    # Sort by group (with _default first), then by friendly_name
+    services_list.sort(key=lambda s: (s['group'] != '_default', s['group'].lower(), s['friendly_name'].lower()))
     return services_list
 
 
 def display_services(services_list):
     """
-    Display the list of discovered WLED services with cached power state.
+    Display the list of discovered WLED services with cached power state, grouped by group.
     """
     if not services_list:
         print("No WLED services found.")
         return
     
+    # Count devices per group
+    from collections import Counter
+    group_counts = Counter(s['group'] for s in services_list)
+    
     print("\n--- Discovered WLED Hosts ---")
+    current_group = None
     for i, service in enumerate(services_list):
+        # Display group header when group changes
+        if service['group'] != current_group:
+            current_group = service['group']
+            count = group_counts[current_group]
+            print(f"\n--- Group: {current_group} ({count}) ---")
+        
         state_indicator = ""
         if service['power_state'] is True:
             state_indicator = "[ON] "
@@ -274,13 +295,14 @@ def set_power(service, state):
         return False
 
 
-def parse_range(range_str, max_index):
+def parse_range(range_str, max_index, services_list=None):
     """
-    Parse a range string like '3', '1-5', '0,2-4,7', or 'all' into a list of indices.
+    Parse a range string like '3', '1-5', '0,2-4,7', 'all', or group names into a list of indices.
     
     Args:
-        range_str: String like '3', '1-5', '0,2-4,7', or 'all' (comma-separated ranges/singles)
+        range_str: String like '3', '1-5', '0,2-4,7', 'all', or group name (comma-separated, can mix)
         max_index: Maximum valid index (exclusive)
+        services_list: Optional list of services for group name resolution
     
     Returns:
         List of valid indices (deduplicated and sorted), or None if invalid
@@ -292,13 +314,13 @@ def parse_range(range_str, max_index):
     try:
         indices = []
         
-        # Split by commas to handle comma-separated ranges/singles
+        # Split by commas to handle comma-separated ranges/singles/groups
         parts = range_str.split(',')
         
         for part in parts:
             part = part.strip()
-            if '-' in part:
-                # Handle range like '1-5'
+            if '-' in part and part[0].isdigit():
+                # Handle numeric range like '1-5'
                 range_parts = part.split('-')
                 if len(range_parts) != 2:
                     return None
@@ -307,12 +329,23 @@ def parse_range(range_str, max_index):
                 if start < 0 or end >= max_index or start > end:
                     return None
                 indices.extend(range(start, end + 1))
-            else:
-                # Handle single index like '3'
+            elif part.isdigit():
+                # Handle single numeric index like '3'
                 index = int(part)
                 if index < 0 or index >= max_index:
                     return None
                 indices.append(index)
+            elif services_list is not None and part.replace('_', '').isalnum():
+                # Handle group name (alphanumeric with underscores)
+                group_name = part.lower()
+                group_indices = [i for i, s in enumerate(services_list) if s['group'].lower() == group_name]
+                if not group_indices:
+                    # Group doesn't exist - this is an error
+                    return None
+                indices.extend(group_indices)
+            else:
+                # Invalid format
+                return None
         
         # Remove duplicates and sort
         return sorted(set(indices))
@@ -432,6 +465,10 @@ def command_loop():
                 print("                   : Get and display JSON status")
                 print("                     Optional fields: CSV list with dot/bracket notation")
                 print("                     Example: info 0 on,bri,seg[0].bri,udpn.send")
+                print("  group <range> <groupid>")
+                print("                   : Assign devices to a group")
+                print("                     Devices not in range with same groupid -> _default")
+                print("                     Exception: _default is additive only")
                 print("  ui <nn>          : Launch WLED UI in browser")
                 print("  scan [seconds]   : Rescan network for WLED devices")
                 print("                     Default: 10 seconds")
@@ -445,7 +482,9 @@ def command_loop():
                 print("  <nn>             : Single device (e.g., 0)")
                 print("  <nn>-<mm>        : Range of devices (e.g., 1-3)")
                 print("  <nn>,<mm>,...    : Multiple devices/ranges (e.g., 0,2-4,7)")
+                print("  <groupid>        : Group name (e.g., living_room)")
                 print("  all              : All devices")
+                print("                     Note: Can mix syntax (e.g., 0,living_room,5)")
                 print()
                 print("Sync Groups:")
                 print("  1-8              : Group numbers (e.g., 1,3,5)")
@@ -464,7 +503,7 @@ def command_loop():
                         print("Invalid scan time. Using default of 10 seconds.")
                         scan_time = 10
                 
-                services_list = scan_wled_devices(scan_time)
+                services_list = scan_wled_devices(scan_time, services_list)
                 clear_screen()
                 display_services(services_list)
             
@@ -485,9 +524,9 @@ def command_loop():
                     print("No devices found. Run 'scan' first.")
                     continue
                 
-                indices = parse_range(parts[1], len(services_list))
+                indices = parse_range(parts[1], len(services_list), services_list)
                 if indices is None:
-                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
                 state = (cmd == 'on')
@@ -506,9 +545,9 @@ def command_loop():
                     print("No devices found. Run 'scan' first.")
                     continue
                 
-                indices = parse_range(parts[1], len(services_list))
+                indices = parse_range(parts[1], len(services_list), services_list)
                 if indices is None:
-                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
                 id_mode(services_list, indices)
@@ -537,9 +576,9 @@ def command_loop():
                     print("Usage: sync <nn>[-<mm>] {on|off}")
                     continue
                 
-                indices = parse_range(range_spec, len(services_list))
+                indices = parse_range(range_spec, len(services_list), services_list)
                 if indices is None:
-                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
                 enabled = (on_off == 'on')
@@ -570,9 +609,9 @@ def command_loop():
                 send_groups = sync_parts[2]
                 recv_groups = sync_parts[4] if len(sync_parts) > 4 else ''
                 
-                indices = parse_range(range_spec, len(services_list))
+                indices = parse_range(range_spec, len(services_list), services_list)
                 if indices is None:
-                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
                 send_mask = parse_sync_groups(send_groups)
@@ -601,9 +640,9 @@ def command_loop():
                     print("No devices found. Run 'scan' first.")
                     continue
                 
-                indices = parse_range(parts[1], len(services_list))
+                indices = parse_range(parts[1], len(services_list), services_list)
                 if indices is None:
-                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
                 # Refresh power state from devices
@@ -631,9 +670,9 @@ def command_loop():
                 range_spec = info_parts[0]
                 fields_str = info_parts[1] if len(info_parts) > 1 else None
                 
-                indices = parse_range(range_spec, len(services_list))
+                indices = parse_range(range_spec, len(services_list), services_list)
                 if indices is None:
-                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
                 import json
@@ -656,6 +695,58 @@ def command_loop():
                         else:
                             # Display full JSON
                             print(json.dumps(status, indent=2))
+            
+            elif cmd == 'group':
+                if len(parts) < 2:
+                    print("Usage: group <range> <groupid>")
+                    print("Example: group 0-2 living_room")
+                    continue
+                
+                if not services_list:
+                    print("No devices found. Run 'scan' first.")
+                    continue
+                
+                # Parse: group <range> <groupid>
+                group_parts = parts[1].split(maxsplit=1)
+                if len(group_parts) < 2:
+                    print("Usage: group <range> <groupid>")
+                    print("Example: group 0-2 living_room")
+                    continue
+                
+                range_spec = group_parts[0]
+                group_id = group_parts[1].strip()
+                
+                # Validate group_id is alphanumeric (with underscores)
+                if not group_id.replace('_', '').isalnum():
+                    print("Group ID must be alphanumeric (underscores allowed).")
+                    continue
+                
+                # Parse range - DON'T pass services_list since we can't use group names in group command
+                indices = parse_range(range_spec, len(services_list), None)
+                if indices is None:
+                    print(f"Invalid range. Valid indices: 0-{len(services_list)-1}")
+                    print("Note: Group names cannot be used in the group command.")
+                    continue
+                
+                group_id_lower = group_id.lower()
+                
+                # Apply grouping logic:
+                # (a) Set group for devices in range
+                for idx in indices:
+                    services_list[idx]['group'] = group_id
+                
+                # (b) Reset devices NOT in range but with same group_id to _default
+                #     EXCEPT when group_id is '_default' (additive mode)
+                if group_id_lower != '_default':
+                    for idx, service in enumerate(services_list):
+                        if idx not in indices and service['group'].lower() == group_id_lower:
+                            service['group'] = '_default'
+                
+                # Re-sort the list by group and name
+                services_list.sort(key=lambda s: (s['group'] != '_default', s['group'].lower(), s['friendly_name'].lower()))
+                
+                clear_screen()
+                display_services(services_list)
             
             elif cmd == 'ui':
                 if len(parts) < 2:
