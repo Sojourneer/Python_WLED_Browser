@@ -6,6 +6,9 @@ import os
 import readline  # Enables command-line editing (arrow keys, history, etc.)
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
+# Global retry count for device commands
+retry_count = 0
+
 class WLEDListener(ServiceListener):
     """
     A listener class to collect discovered WLED services.
@@ -148,6 +151,37 @@ def parse_sync_groups(groups_str):
         return None
 
 
+def retry_request(func):
+    """
+    Decorator to retry a function that makes HTTP requests to WLED devices.
+    Uses the global retry_count variable.
+    
+    Args:
+        func: Function that returns (success: bool, result: any)
+    
+    Returns:
+        The result from the function after retries
+    """
+    def wrapper(*args, **kwargs):
+        global retry_count
+        attempts = retry_count + 1  # Total attempts = retries + 1 initial attempt
+        
+        for attempt in range(attempts):
+            success, result = func(*args, **kwargs)
+            if success:
+                return success, result
+            
+            # If not successful and more attempts remain, wait briefly before retry
+            if attempt < attempts - 1:
+                time.sleep(0.1)  # Brief delay between retries
+        
+        # Return the last result after all attempts
+        return success, result
+    
+    return wrapper
+
+
+@retry_request
 def set_sync_enabled(service, enabled):
     """
     Enable or disable UDP sync for a device.
@@ -167,15 +201,16 @@ def set_sync_enabled(service, enabled):
             service['sync_enabled'] = enabled  # Update cache
             status = "ON" if enabled else "OFF"
             print(f"  {service['friendly_name']}: sync {status}")
-            return True
+            return True, True
         else:
             print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
-            return False
+            return False, False
     except Exception as e:
         print(f"  {service['friendly_name']}: Error - {e}")
-        return False
+        return False, False
 
 
+@retry_request
 def set_sync_groups(service, send_mask, recv_mask):
     """
     Set WLED sync groups for a device.
@@ -196,15 +231,16 @@ def set_sync_groups(service, send_mask, recv_mask):
             service['sync_send'] = send_mask  # Update cache
             service['sync_recv'] = recv_mask  # Update cache
             print(f"  {service['friendly_name']}: send={send_mask}, recv={recv_mask}")
-            return True
+            return True, True
         else:
             print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
-            return False
+            return False, False
     except Exception as e:
         print(f"  {service['friendly_name']}: Error - {e}")
-        return False
+        return False, False
 
 
+@retry_request
 def get_status(service):
     """
     Get the full JSON status from a WLED device.
@@ -213,19 +249,19 @@ def get_status(service):
         service: The service dict containing host_ip and port
     
     Returns:
-        JSON dict if successful, None otherwise
+        Tuple of (success, JSON dict or None)
     """
     url = f"http://{service['host_ip']}:{service['port']}/json/state"
     try:
         response = requests.get(url, timeout=2)
         if response.status_code == 200:
-            return response.json()
+            return True, response.json()
         else:
             print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
-            return None
+            return False, None
     except Exception as e:
         print(f"  {service['friendly_name']}: Error - {e}")
-        return None
+        return False, None
 
 
 def get_nested_field(data, field_path):
@@ -272,6 +308,7 @@ def get_nested_field(data, field_path):
     return current
 
 
+@retry_request
 def set_power(service, state):
     """
     Turn a WLED device on or off and update cached state.
@@ -287,13 +324,13 @@ def set_power(service, state):
             service['power_state'] = state  # Update cache
             status = "ON" if state else "OFF"
             print(f"  {service['friendly_name']}: {status}")
-            return True
+            return True, True
         else:
             print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
-            return False
+            return False, False
     except Exception as e:
         print(f"  {service['friendly_name']}: Error - {e}")
-        return False
+        return False, False
 
 
 def parse_range(range_str, max_index, services_list=None):
@@ -476,6 +513,8 @@ def command_loop():
                 print("  list             : Refresh device list display")
                 print()
                 print("General:")
+                print("  retries <n>      : Set number of retries for device commands")
+                print("                     Default: 0 (no retries)")
                 print("  help             : Show this help message")
                 print("  quit / exit      : Exit the program")
                 print()
@@ -649,8 +688,8 @@ def command_loop():
                 # Refresh power state from devices
                 for idx in indices:
                     service = services_list[idx]
-                    status = get_status(service)
-                    if status:
+                    success, status = get_status(service)
+                    if success and status:
                         service['power_state'] = status.get('on', None)
                 
                 clear_screen()
@@ -686,8 +725,8 @@ def command_loop():
                 for idx in indices:
                     service = services_list[idx]
                     print(f"\n--- Info for {idx}. {service['friendly_name']} ---")
-                    status = get_status(service)
-                    if status:
+                    success, status = get_status(service)
+                    if success and status:
                         if fields:
                             # Display only requested fields
                             for field in fields:
@@ -748,6 +787,24 @@ def command_loop():
                 
                 clear_screen()
                 display_services(services_list)
+            
+            elif cmd == 'retries':
+                global retry_count
+                if len(parts) < 2:
+                    print(f"Current retry count: {retry_count}")
+                    print("Usage: retries <n>")
+                    print("Example: retries 3")
+                    continue
+                
+                try:
+                    new_count = int(parts[1])
+                    if new_count < 0:
+                        print("Retry count must be non-negative.")
+                        continue
+                    retry_count = new_count
+                    print(f"Retry count set to {retry_count}")
+                except ValueError:
+                    print("Invalid retry count. Please enter a number.")
             
             elif cmd == 'ui':
                 if len(parts) < 2:
