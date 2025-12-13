@@ -74,12 +74,13 @@ def scan_wled_devices(discovery_time_seconds=10, existing_services=None):
 
     services_list = list(listener.services.values())
     
-    # Preserve group assignments from existing services
+    # Preserve group assignments and power state from existing services
     if existing_services:
-        existing_groups = {s['host_ip']: s['group'] for s in existing_services}
+        existing_data = {s['host_ip']: {'group': s['group'], 'power_state': s['power_state']} for s in existing_services}
         for service in services_list:
-            if service['host_ip'] in existing_groups:
-                service['group'] = existing_groups[service['host_ip']]
+            if service['host_ip'] in existing_data:
+                service['group'] = existing_data[service['host_ip']]['group']
+                service['power_state'] = existing_data[service['host_ip']]['power_state']
     
     # Sort by group (with _default first), then by friendly_name
     services_list.sort(key=lambda s: (s['group'] != '_default', s['group'].lower(), s['friendly_name'].lower()))
