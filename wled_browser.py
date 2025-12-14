@@ -724,16 +724,30 @@ def command_loop():
                 
                 for idx in indices:
                     service = services_list[idx]
-                    print(f"\n--- Info for {idx}. {service['friendly_name']} ---")
                     success, status = get_status(service)
                     if success and status:
                         if fields:
                             # Display only requested fields
+                            # Check if we can fit everything on one line
+                            field_values = []
                             for field in fields:
                                 value = get_nested_field(status, field)
-                                print(f"  {field}: {json.dumps(value)}")
+                                field_values.append((field, value))
+                            
+                            # If single field or all simple values, use compact format
+                            all_simple = all(not isinstance(v, (dict, list)) for _, v in field_values)
+                            if all_simple:
+                                # Single line format: idx. name: field1=value1, field2=value2
+                                value_strs = [f"{field}={json.dumps(value)}" for field, value in field_values]
+                                print(f"{idx}. {service['friendly_name']}: {', '.join(value_strs)}")
+                            else:
+                                # Multi-line format for complex values
+                                print(f"{idx}. {service['friendly_name']}:")
+                                for field, value in field_values:
+                                    print(f"  {field}: {json.dumps(value)}")
                         else:
-                            # Display full JSON
+                            # Display full JSON with header
+                            print(f"{idx}. {service['friendly_name']}:")
                             print(json.dumps(status, indent=2))
             
             elif cmd == 'group':
