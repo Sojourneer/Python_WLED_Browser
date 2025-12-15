@@ -13,6 +13,10 @@ retry_count = 0
 last_command = None  # Full command string
 last_failed_indices = []  # List of indices that failed
 
+# Master service database (persistent across scans)
+# List of service dictionaries with idx field for display order
+service_db = []
+
 class WLEDListener(ServiceListener):
     """
     A listener class to collect discovered WLED services.
@@ -42,6 +46,7 @@ class WLEDListener(ServiceListener):
                 'host_ip': address,
                 'port': info.port,
                 'friendly_name': friendly_name,
+                'idx': None,          # Display index (assigned by reindex_services)
                 'group': '_default',  # Group identifier
                 'power_state': None,  # Cache for power state
                 'sync_enabled': None, # Cache for UDP sync on/off
@@ -59,17 +64,17 @@ class WLEDListener(ServiceListener):
             self.services[name]['power_state'] = existing.get('power_state', None) 
 
 
-def scan_wled_devices(discovery_time_seconds=10, service_db=None):
+def scan_wled_devices(discovery_time_seconds=10):
     """
-    Scan for WLED devices on the network.
+    Scan for WLED devices on the network and update the global service_db.
+    New devices are added with default metadata.
+    Existing devices have their network info updated.
     
     Args:
         discovery_time_seconds: Time to scan for devices (default: 10)
-        service_db: Service database to preserve group assignments
-    
-    Returns:
-        List of discovered services.
     """
+    global service_db
+    
     service_type = "_wled._tcp.local."
 
     zeroconf = Zeroconf()
@@ -85,39 +90,46 @@ def scan_wled_devices(discovery_time_seconds=10, service_db=None):
     finally:
         zeroconf.close()
 
-    # Treat service_db as the working database
-    # Use new scan results to update/add devices
-    # Key: host_ip (invariant during script lifetime)
-    if service_db:
-        # Build lookup by host_ip
-        existing_by_ip = {s['host_ip']: s for s in service_db}
-        
-        # Process new scan results
-        for new_service in listener.services.values():
-            ip = new_service['host_ip']
-            if ip in existing_by_ip:
-                # Known device - update mDNS info but preserve group/state
-                existing_by_ip[ip]['name_long'] = new_service['name_long']
-                existing_by_ip[ip]['port'] = new_service['port']
-                existing_by_ip[ip]['friendly_name'] = new_service['friendly_name']
-                # group and power_state are preserved
-            else:
-                # New device - add it to the database
-                existing_by_ip[ip] = new_service
-        
-        services_list = list(existing_by_ip.values())
-    else:
-        # First scan - use results as-is
-        services_list = list(listener.services.values())
+    # Process new scan results - update or add to service_db
+    for new_service in listener.services.values():
+        ip = new_service['host_ip']
+        # Find existing service by host_ip
+        existing = next((s for s in service_db if s['host_ip'] == ip), None)
+        if existing:
+            # Known device - update mDNS info but preserve metadata
+            existing['name_long'] = new_service['name_long']
+            existing['port'] = new_service['port']
+            existing['friendly_name'] = new_service['friendly_name']
+            # group, power_state, and idx are preserved
+        else:
+            # New device - add it to the database with defaults
+            service_db.append(new_service)
+
+
+def reindex_services():
+    """
+    Sort service_db and assign display indices (idx).
+    Services are sorted and indexed 0..N:
+    - _default group first, then other groups alphabetically
+    - Within each group, sorted by friendly_name
     
-    # Sort by group (with _default first), then by friendly_name
-    services_list.sort(key=lambda s: (s['group'] != '_default', s['group'].lower(), s['friendly_name'].lower()))
-    return services_list
+    After this, service_db[i]['idx'] == i.
+    Called after operations that change service set or groups (scan, group command).
+    """
+    # Sort in place
+    service_db.sort(key=lambda s: (s['group'] != '_default', s['group'].lower(), s['friendly_name'].lower()))
+    
+    # Assign indices to match list positions
+    for idx, service in enumerate(service_db):
+        service['idx'] = idx
 
 
 def display_services(services_list):
     """
     Display the list of discovered WLED services with cached power state, grouped by group.
+    
+    Args:
+        services_list: List of services to display (service_db after reindex)
     """
     if not services_list:
         print("No WLED services found.")
@@ -465,13 +477,17 @@ def parse_range(range_str, max_index, services_list=None):
     """
     Parse a range string like '3', '1-5', '0,2-4,7', 'all', or group names into a list of indices.
     
+    With idx-based architecture, this returns the idx values from service entries.
+    For numeric ranges: directly returns those idx values (0-based display numbers)
+    For group names: finds services with that group and returns their idx values
+    
     Args:
         range_str: String like '3', '1-5', '0,2-4,7', 'all', or group name (comma-separated, can mix)
-        max_index: Maximum valid index (exclusive)
+        max_index: Maximum valid index (exclusive) - typically len(services_list)
         services_list: Optional list of services for group name resolution
     
     Returns:
-        List of valid indices (deduplicated and sorted), or None if invalid
+        List of valid idx values (deduplicated and sorted), or None if invalid
     """
     # Handle 'all' keyword
     if range_str.strip().lower() == 'all':
@@ -503,8 +519,9 @@ def parse_range(range_str, max_index, services_list=None):
                 indices.append(index)
             elif services_list is not None and part.replace('_', '').isalnum():
                 # Handle group name (alphanumeric with underscores)
+                # Find all services with this group and collect their idx values
                 group_name = part.lower()
-                group_indices = [i for i, s in enumerate(services_list) if s['group'].lower() == group_name]
+                group_indices = [s['idx'] for s in services_list if s['group'].lower() == group_name]
                 if not group_indices:
                     # Group doesn't exist - this is an error
                     return None
@@ -587,21 +604,23 @@ def command_loop():
     """
     Main command loop for interacting with WLED devices.
     """
-    global last_command, last_failed_indices
-
-    services_list = []
+    global last_command, last_failed_indices, service_db
     
     print("WLED Browser - Command Interface")
     print("Type 'help' for available commands\n")
     
     # Initial scan
-    services_list = scan_wled_devices()
+    scan_wled_devices()
+    reindex_services()
     clear_screen()
-    display_services(services_list)
+    display_services(service_db)
     
     while True:
         try:
             command = input("\n> ").strip()
+            
+            # Get current services list (service_db is already sorted by idx)
+            services_list = service_db
             
             if not command:
                 clear_screen()
@@ -683,7 +702,9 @@ def command_loop():
                 # Clear retry state after scan (indices change)
                 global last_command, last_failed_indices
                 
-                services_list = scan_wled_devices(scan_time, services_list)
+                scan_wled_devices(scan_time)
+                reindex_services()
+                services_list = service_db  # Refresh local reference
                 clear_screen()
                 display_services(services_list)
                 
@@ -1015,7 +1036,6 @@ def command_loop():
                 
                 group_id_lower = group_id.lower()
                 
-                # Clear retry state (not a retryable command)
                 # Apply grouping logic:
                 # (a) Set group for devices in range
                 for idx in indices:
@@ -1024,16 +1044,18 @@ def command_loop():
                 # (b) Reset devices NOT in range but with same group_id to _default
                 #     EXCEPT when group_id is '_default' (additive mode)
                 if group_id_lower != '_default':
-                    for idx, service in enumerate(services_list):
-                        if idx not in indices and service['group'].lower() == group_id_lower:
+                    for service in service_db:
+                        if service['idx'] not in indices and service['group'].lower() == group_id_lower:
                             service['group'] = '_default'
                 
-                # Re-sort the list by group and name
-                services_list.sort(key=lambda s: (s['group'] != '_default', s['group'].lower(), s['friendly_name'].lower()))
+                # Reindex after group changes (sort order changed)
+                reindex_services()
+                services_list = service_db  # Refresh list view
                 
                 clear_screen()
                 display_services(services_list)
                 
+                # Clear retry state (not a retryable command, indices changed)
                 last_command = None
                 last_failed_indices = []
             
