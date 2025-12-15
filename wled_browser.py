@@ -333,6 +333,31 @@ def set_power(service, state):
         return False, False
 
 
+@retry_request
+def reboot_device(service):
+    """
+    Reboot a WLED device.
+    
+    Args:
+        service: The service dict containing host_ip and port
+    
+    API Reference: https://kno.wled.ge/interfaces/json-api/
+    rb: Reboot the device
+    """
+    url = f"http://{service['host_ip']}:{service['port']}/json/state"
+    try:
+        response = requests.post(url, json={"rb": True}, timeout=2)
+        if response.status_code == 200:
+            print(f"  {service['friendly_name']}: Rebooting")
+            return True, True
+        else:
+            print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
+            return False, False
+    except Exception as e:
+        print(f"  {service['friendly_name']}: Error - {e}")
+        return False, False
+
+
 def parse_range(range_str, max_index, services_list=None):
     """
     Parse a range string like '3', '1-5', '0,2-4,7', 'all', or group names into a list of indices.
@@ -487,6 +512,7 @@ def command_loop():
                 print("\nPower Control:")
                 print("  on <range>       : Turn on device(s)")
                 print("  off <range>      : Turn off device(s)")
+                print("  reboot <range>   : Reboot device(s)")
                 print()
                 print("Sync Control:")
                 print("  sync <range> {on|off}")
@@ -575,6 +601,26 @@ def command_loop():
                 
                 clear_screen()
                 display_services(services_list)
+            
+            elif cmd == 'reboot':
+                if len(parts) < 2:
+                    print("Usage: reboot <nn>[-<mm>]")
+                    continue
+                
+                if not services_list:
+                    print("No devices found. Run 'scan' first.")
+                    continue
+                
+                indices = parse_range(parts[1], len(services_list), services_list)
+                if indices is None:
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
+                    continue
+                
+                print("Rebooting devices...")
+                for idx in indices:
+                    reboot_device(services_list[idx])
+                
+                print("Note: Devices will be offline for ~10 seconds during reboot.")
             
             elif cmd == 'id':
                 if len(parts) < 2:
