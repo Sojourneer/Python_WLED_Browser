@@ -9,6 +9,10 @@ from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 # Global retry count for device commands
 retry_count = 0
 
+# Track last command for retry functionality
+last_command = None  # Full command string
+last_failed_indices = []  # List of indices that failed
+
 class WLEDListener(ServiceListener):
     """
     A listener class to collect discovered WLED services.
@@ -45,17 +49,23 @@ class WLEDListener(ServiceListener):
                 'sync_recv': None     # Cache for sync recv groups (bitmask)
             }
 
-    # update_service is called when a service's info changes; treat same as add
-    update_service = add_service 
+    def update_service(self, zc: Zeroconf, type_: str, name: str) -> None:
+        # Preserve group and cached state when service info changes
+        existing = self.services.get(name)
+        self.add_service(zc, type_, name)
+        if existing and name in self.services:
+            # Restore preserved values
+            self.services[name]['group'] = existing.get('group', '_default')
+            self.services[name]['power_state'] = existing.get('power_state', None) 
 
 
-def scan_wled_devices(discovery_time_seconds=10, existing_services=None):
+def scan_wled_devices(discovery_time_seconds=10, service_db=None):
     """
     Scan for WLED devices on the network.
     
     Args:
         discovery_time_seconds: Time to scan for devices (default: 10)
-        existing_services: Existing services list to preserve group assignments
+        service_db: Service database to preserve group assignments
     
     Returns:
         List of discovered services.
@@ -75,15 +85,30 @@ def scan_wled_devices(discovery_time_seconds=10, existing_services=None):
     finally:
         zeroconf.close()
 
-    services_list = list(listener.services.values())
-    
-    # Preserve group assignments and power state from existing services
-    if existing_services:
-        existing_data = {s['host_ip']: {'group': s['group'], 'power_state': s['power_state']} for s in existing_services}
-        for service in services_list:
-            if service['host_ip'] in existing_data:
-                service['group'] = existing_data[service['host_ip']]['group']
-                service['power_state'] = existing_data[service['host_ip']]['power_state']
+    # Treat service_db as the working database
+    # Use new scan results to update/add devices
+    # Key: host_ip (invariant during script lifetime)
+    if service_db:
+        # Build lookup by host_ip
+        existing_by_ip = {s['host_ip']: s for s in service_db}
+        
+        # Process new scan results
+        for new_service in listener.services.values():
+            ip = new_service['host_ip']
+            if ip in existing_by_ip:
+                # Known device - update mDNS info but preserve group/state
+                existing_by_ip[ip]['name_long'] = new_service['name_long']
+                existing_by_ip[ip]['port'] = new_service['port']
+                existing_by_ip[ip]['friendly_name'] = new_service['friendly_name']
+                # group and power_state are preserved
+            else:
+                # New device - add it to the database
+                existing_by_ip[ip] = new_service
+        
+        services_list = list(existing_by_ip.values())
+    else:
+        # First scan - use results as-is
+        services_list = list(listener.services.values())
     
     # Sort by group (with _default first), then by friendly_name
     services_list.sort(key=lambda s: (s['group'] != '_default', s['group'].lower(), s['friendly_name'].lower()))
@@ -562,6 +587,8 @@ def command_loop():
     """
     Main command loop for interacting with WLED devices.
     """
+    global last_command, last_failed_indices
+
     services_list = []
     
     print("WLED Browser - Command Interface")
@@ -624,6 +651,7 @@ def command_loop():
                 print("General:")
                 print("  retries <n>      : Set number of retries for device commands")
                 print("                     Default: 0 (no retries)")
+                print("  retry            : Retry previous command on failed devices only")
                 print("  help             : Show this help message")
                 print("  quit / exit      : Exit the program")
                 print()
@@ -652,13 +680,23 @@ def command_loop():
                         print("Invalid scan time. Using default of 10 seconds.")
                         scan_time = 10
                 
+                # Clear retry state after scan (indices change)
+                global last_command, last_failed_indices
+                
                 services_list = scan_wled_devices(scan_time, services_list)
                 clear_screen()
                 display_services(services_list)
+                
+                last_command = None
+                last_failed_indices = []
             
             elif cmd == 'list':
+                # Clear retry state (not a device command)
                 clear_screen()
                 display_services(services_list)
+                
+                last_command = None
+                last_failed_indices = []
             
             elif cmd in ['quit', 'exit', 'q']:
                 print("Exiting.")
@@ -678,9 +716,18 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
+                last_command = command
+                last_failed_indices = []
+                
                 state = (cmd == 'on')
                 for idx in indices:
-                    set_power(services_list[idx], state, idx)
+                    success, _ = set_power(services_list[idx], state, idx)
+                    if not success:
+                        last_failed_indices.append(idx)
+                
+                # If no failures, clear retry state
+                if not last_failed_indices:
+                    last_command = None
                 
                 clear_screen()
                 display_services(services_list)
@@ -699,9 +746,18 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
+                last_command = command
+                last_failed_indices = []
+                
                 print("Rebooting devices...")
                 for idx in indices:
-                    reboot_device(services_list[idx], idx)
+                    success, _ = reboot_device(services_list[idx], idx)
+                    if not success:
+                        last_failed_indices.append(idx)
+                
+                # If no failures, clear retry state
+                if not last_failed_indices:
+                    last_command = None
                 
                 print("Note: Devices will be offline for ~10 seconds during reboot.")
             
@@ -719,9 +775,13 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
+                # Clear retry state (not a retryable command)
                 id_mode(services_list, indices)
                 clear_screen()
                 display_services(services_list)
+                
+                last_command = None
+                last_failed_indices = []
             
             elif cmd == 'sync':
                 if len(parts) < 2:
@@ -750,9 +810,18 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
+                last_command = command
+                last_failed_indices = []
+                
                 enabled = (on_off == 'on')
                 for idx in indices:
-                    set_sync_enabled(services_list[idx], enabled, idx)
+                    success, _ = set_sync_enabled(services_list[idx], enabled, idx)
+                    if not success:
+                        last_failed_indices.append(idx)
+                
+                # If no failures, clear retry state
+                if not last_failed_indices:
+                    last_command = None
                 
                 clear_screen()
                 display_services(services_list)
@@ -794,8 +863,17 @@ def command_loop():
                     print(f"Invalid recv groups: {recv_groups}. Use format: 1,3,5 or none")
                     continue
                 
+                last_command = command
+                last_failed_indices = []
+                
                 for idx in indices:
-                    set_sync_groups(services_list[idx], send_mask, recv_mask, idx)
+                    success, _ = set_sync_groups(services_list[idx], send_mask, recv_mask, idx)
+                    if not success:
+                        last_failed_indices.append(idx)
+                
+                # If no failures, clear retry state
+                if not last_failed_indices:
+                    last_command = None
                 
                 clear_screen()
                 display_services(services_list)
@@ -814,12 +892,21 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
+                last_command = command
+                last_failed_indices = []
+                
                 # Refresh power state from devices
                 for idx in indices:
                     service = services_list[idx]
                     success, status = get_status(service, idx)
                     if success and status:
                         service['power_state'] = status.get('on', None)
+                    elif not success:
+                        last_failed_indices.append(idx)
+                
+                # If no failures, clear retry state
+                if not last_failed_indices:
+                    last_command = None
                 
                 clear_screen()
                 display_services(services_list)
@@ -844,11 +931,20 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
+                last_command = command
+                last_failed_indices = []
+                
                 for idx in indices:
                     service = services_list[idx]
                     success, status = get_status(service, idx)
                     if success and status:
                         display_json_data(idx, service, status, fields_str)
+                    elif not success:
+                        last_failed_indices.append(idx)
+                
+                # If no failures, clear retry state
+                if not last_failed_indices:
+                    last_command = None
             
             elif cmd == 'info':
                 if len(parts) < 2:
@@ -870,11 +966,20 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
+                last_command = command
+                last_failed_indices = []
+                
                 for idx in indices:
                     service = services_list[idx]
                     success, info_data = get_info(service, idx)
                     if success and info_data:
                         display_json_data(idx, service, info_data, fields_str)
+                    elif not success:
+                        last_failed_indices.append(idx)
+                
+                # If no failures, clear retry state
+                if not last_failed_indices:
+                    last_command = None
             
             elif cmd == 'group':
                 if len(parts) < 2:
@@ -910,6 +1015,7 @@ def command_loop():
                 
                 group_id_lower = group_id.lower()
                 
+                # Clear retry state (not a retryable command)
                 # Apply grouping logic:
                 # (a) Set group for devices in range
                 for idx in indices:
@@ -927,9 +1033,13 @@ def command_loop():
                 
                 clear_screen()
                 display_services(services_list)
+                
+                last_command = None
+                last_failed_indices = []
             
             elif cmd == 'retries':
                 global retry_count
+                
                 if len(parts) < 2:
                     print(f"Current retry count: {retry_count}")
                     print("Usage: retries <n>")
@@ -943,10 +1053,212 @@ def command_loop():
                         continue
                     retry_count = new_count
                     print(f"Retry count set to {retry_count}")
+                    
+                    # Clear retry state (not a retryable command)
+                    last_command = None
+                    last_failed_indices = []
                 except ValueError:
                     print("Invalid retry count. Please enter a number.")
             
+            elif cmd == 'retry':
+                if not last_command:
+                    print("No previous command to retry.")
+                    continue
+                
+                if not last_failed_indices:
+                    print("No failures in previous command.")
+                    continue
+                
+                if not services_list:
+                    print("No devices found. Run 'scan' first.")
+                    continue
+                
+                # Build a new command with failed indices
+                indices_str = ','.join(str(idx) for idx in sorted(last_failed_indices))
+                
+                # Parse original command to extract base command
+                orig_parts = last_command.split(maxsplit=1)
+                orig_cmd = orig_parts[0].lower()
+                
+                # Reconstruct command with failed indices only
+                if orig_cmd in ['on', 'off', 'reboot', 'power']:
+                    new_command = f"{orig_cmd} {indices_str}"
+                elif orig_cmd == 'sync':
+                    # Extract on/off parameter
+                    sync_parts = orig_parts[1].split()
+                    if len(sync_parts) >= 2:
+                        new_command = f"sync {indices_str} {sync_parts[1]}"
+                    else:
+                        print("Cannot reconstruct sync command.")
+                        continue
+                elif orig_cmd == 'syncgroups':
+                    # Extract send/recv parameters
+                    sync_parts = orig_parts[1].split()
+                    if len(sync_parts) >= 4:
+                        # Format: syncgroups <range> send <groups> recv <groups>
+                        send_idx = sync_parts.index('send') if 'send' in sync_parts else -1
+                        recv_idx = sync_parts.index('recv') if 'recv' in sync_parts else -1
+                        if send_idx > 0 and recv_idx > send_idx:
+                            send_groups = sync_parts[send_idx + 1]
+                            recv_groups = sync_parts[recv_idx + 1] if recv_idx + 1 < len(sync_parts) else ''
+                            new_command = f"syncgroups {indices_str} send {send_groups} recv {recv_groups}"
+                        else:
+                            print("Cannot reconstruct syncgroups command.")
+                            continue
+                    else:
+                        print("Cannot reconstruct syncgroups command.")
+                        continue
+                elif orig_cmd == 'state':
+                    # Extract optional fields parameter
+                    state_parts = orig_parts[1].split(maxsplit=1)
+                    if len(state_parts) > 1:
+                        new_command = f"state {indices_str} {state_parts[1]}"
+                    else:
+                        new_command = f"state {indices_str}"
+                elif orig_cmd == 'info':
+                    # Extract optional fields parameter
+                    info_parts = orig_parts[1].split(maxsplit=1)
+                    if len(info_parts) > 1:
+                        new_command = f"info {indices_str} {info_parts[1]}"
+                    else:
+                        new_command = f"info {indices_str}"
+                else:
+                    print(f"Command '{orig_cmd}' cannot be retried.")
+                    continue
+                
+                print(f"Retrying: {new_command}")
+                # Re-inject the command by setting 'command' variable
+                # and jumping back to command processing
+                command = new_command
+                parts = command.split(maxsplit=1)
+                cmd = parts[0].lower()
+                
+                # Now process it - this is a bit hacky but works
+                # We need to continue processing from the top of the command handling
+                # For now, let's just recursively call the handler based on cmd
+                if cmd == 'on' or cmd == 'off':
+                    if len(parts) < 2:
+                        continue
+                    indices = parse_range(parts[1], len(services_list), services_list)
+                    if indices is None:
+                        continue
+                    last_command = command
+                    last_failed_indices = []
+                    state = (cmd == 'on')
+                    for idx in indices:
+                        success, _ = set_power(services_list[idx], state, idx)
+                        if not success:
+                            last_failed_indices.append(idx)
+                    clear_screen()
+                    display_services(services_list)
+                elif cmd == 'reboot':
+                    if len(parts) < 2:
+                        continue
+                    indices = parse_range(parts[1], len(services_list), services_list)
+                    if indices is None:
+                        continue
+                    last_command = command
+                    last_failed_indices = []
+                    print("Rebooting devices...")
+                    for idx in indices:
+                        success, _ = reboot_device(services_list[idx], idx)
+                        if not success:
+                            last_failed_indices.append(idx)
+                    print("Note: Devices will be offline for ~10 seconds during reboot.")
+                elif cmd == 'sync':
+                    sync_parts = parts[1].split()
+                    if len(sync_parts) < 2:
+                        continue
+                    range_spec = sync_parts[0]
+                    on_off = sync_parts[1].lower()
+                    if on_off not in ['on', 'off']:
+                        continue
+                    indices = parse_range(range_spec, len(services_list), services_list)
+                    if indices is None:
+                        continue
+                    last_command = command
+                    last_failed_indices = []
+                    enabled = (on_off == 'on')
+                    for idx in indices:
+                        success, _ = set_sync_enabled(services_list[idx], enabled, idx)
+                        if not success:
+                            last_failed_indices.append(idx)
+                    clear_screen()
+                    display_services(services_list)
+                elif cmd == 'syncgroups':
+                    sync_parts = parts[1].split()
+                    if len(sync_parts) < 4:
+                        continue
+                    range_spec = sync_parts[0]
+                    send_groups = sync_parts[2]
+                    recv_groups = sync_parts[4] if len(sync_parts) > 4 else ''
+                    indices = parse_range(range_spec, len(services_list), services_list)
+                    if indices is None:
+                        continue
+                    send_mask = parse_sync_groups(send_groups)
+                    recv_mask = parse_sync_groups(recv_groups)
+                    if send_mask is None or recv_mask is None:
+                        continue
+                    last_command = command
+                    last_failed_indices = []
+                    for idx in indices:
+                        success, _ = set_sync_groups(services_list[idx], send_mask, recv_mask, idx)
+                        if not success:
+                            last_failed_indices.append(idx)
+                    clear_screen()
+                    display_services(services_list)
+                elif cmd == 'power':
+                    if len(parts) < 2:
+                        continue
+                    indices = parse_range(parts[1], len(services_list), services_list)
+                    if indices is None:
+                        continue
+                    last_command = command
+                    last_failed_indices = []
+                    for idx in indices:
+                        service = services_list[idx]
+                        success, status = get_status(service, idx)
+                        if success and status:
+                            service['power_state'] = status.get('on', None)
+                        elif not success:
+                            last_failed_indices.append(idx)
+                    clear_screen()
+                    display_services(services_list)
+                elif cmd == 'state':
+                    info_parts = parts[1].split(maxsplit=1)
+                    range_spec = info_parts[0]
+                    fields_str = info_parts[1] if len(info_parts) > 1 else None
+                    indices = parse_range(range_spec, len(services_list), services_list)
+                    if indices is None:
+                        continue
+                    last_command = command
+                    last_failed_indices = []
+                    for idx in indices:
+                        service = services_list[idx]
+                        success, status = get_status(service, idx)
+                        if success and status:
+                            display_json_data(idx, service, status, fields_str)
+                        elif not success:
+                            last_failed_indices.append(idx)
+                elif cmd == 'info':
+                    info_parts = parts[1].split(maxsplit=1)
+                    range_spec = info_parts[0]
+                    fields_str = info_parts[1] if len(info_parts) > 1 else None
+                    indices = parse_range(range_spec, len(services_list), services_list)
+                    if indices is None:
+                        continue
+                    last_command = command
+                    last_failed_indices = []
+                    for idx in indices:
+                        service = services_list[idx]
+                        success, info_data = get_info(service, idx)
+                        if success and info_data:
+                            display_json_data(idx, service, info_data, fields_str)
+                        elif not success:
+                            last_failed_indices.append(idx)
+            
             elif cmd == 'ui':
+                # Clear retry state (not a retryable command)
                 if len(parts) < 2:
                     print("Usage: ui <nn>")
                     continue
@@ -965,6 +1277,9 @@ def command_loop():
                     url = f"http://{service['host_ip']}:{service['port']}"
                     print(f"Launching {url} in browser...")
                     webbrowser.open_new_tab(url)
+                    
+                    last_command = None
+                    last_failed_indices = []
                 except ValueError:
                     print("Invalid index. Please enter a number.")
             
