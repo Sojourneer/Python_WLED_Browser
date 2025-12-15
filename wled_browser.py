@@ -182,36 +182,38 @@ def retry_request(func):
 
 
 @retry_request
-def set_sync_enabled(service, enabled):
+def set_sync_enabled(service, enabled, idx=None):
     """
     Enable or disable UDP sync for a device.
     
     Args:
         service: The service dict containing host_ip and port
         enabled: True to enable, False to disable
+        idx: Optional device index for error reporting
     
     API Reference: https://kno.wled.ge/interfaces/json-api/
     udpn.send: Send WLED broadcast (UDP sync) packet on state change
     udpn.recv: Receive broadcast packets
     """
     url = f"http://{service['host_ip']}:{service['port']}/json/state"
+    prefix = f"{idx}. " if idx is not None else "  "
     try:
         response = requests.post(url, json={"udpn": {"send": enabled, "recv": enabled}}, timeout=2)
         if response.status_code == 200:
             service['sync_enabled'] = enabled  # Update cache
             status = "ON" if enabled else "OFF"
-            print(f"  {service['friendly_name']}: sync {status}")
+            print(f"{prefix}{service['friendly_name']}: sync {status}")
             return True, True
         else:
-            print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
+            print(f"{prefix}{service['friendly_name']}: Failed (HTTP {response.status_code})")
             return False, False
     except Exception as e:
-        print(f"  {service['friendly_name']}: Error - {e}")
+        print(f"{prefix}{service['friendly_name']}: Error - {e}")
         return False, False
 
 
 @retry_request
-def set_sync_groups(service, send_mask, recv_mask):
+def set_sync_groups(service, send_mask, recv_mask, idx=None):
     """
     Set WLED sync groups for a device.
     
@@ -219,48 +221,78 @@ def set_sync_groups(service, send_mask, recv_mask):
         service: The service dict containing host_ip and port
         send_mask: Bitmask for send groups (0-255)
         recv_mask: Bitmask for recv groups (0-255)
+        idx: Optional device index for error reporting
     
     API Reference: https://kno.wled.ge/interfaces/json-api/
     udpn.sgrp: Bitfield for broadcast send groups 1-8 (0-255)
     udpn.rgrp: Bitfield for broadcast receive groups 1-8 (0-255)
     """
     url = f"http://{service['host_ip']}:{service['port']}/json/state"
+    prefix = f"{idx}. " if idx is not None else "  "
     try:
         response = requests.post(url, json={"udpn": {"sgrp": send_mask, "rgrp": recv_mask}}, timeout=2)
         if response.status_code == 200:
             service['sync_send'] = send_mask  # Update cache
             service['sync_recv'] = recv_mask  # Update cache
-            print(f"  {service['friendly_name']}: send={send_mask}, recv={recv_mask}")
+            print(f"{prefix}{service['friendly_name']}: send={send_mask}, recv={recv_mask}")
             return True, True
         else:
-            print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
+            print(f"{prefix}{service['friendly_name']}: Failed (HTTP {response.status_code})")
             return False, False
     except Exception as e:
-        print(f"  {service['friendly_name']}: Error - {e}")
+        print(f"{prefix}{service['friendly_name']}: Error - {e}")
         return False, False
 
 
 @retry_request
-def get_status(service):
+def get_status(service, idx=None):
     """
     Get the full JSON status from a WLED device.
     
     Args:
         service: The service dict containing host_ip and port
+        idx: Optional device index for error reporting
     
     Returns:
         Tuple of (success, JSON dict or None)
     """
     url = f"http://{service['host_ip']}:{service['port']}/json/state"
+    prefix = f"{idx}. " if idx is not None else "  "
     try:
         response = requests.get(url, timeout=2)
         if response.status_code == 200:
             return True, response.json()
         else:
-            print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
+            print(f"{prefix}{service['friendly_name']}: Failed (HTTP {response.status_code})")
             return False, None
     except Exception as e:
-        print(f"  {service['friendly_name']}: Error - {e}")
+        print(f"{prefix}{service['friendly_name']}: Error - {e}")
+        return False, None
+
+
+@retry_request
+def get_info(service, idx=None):
+    """
+    Get the full JSON info from a WLED device (includes WiFi status, etc.).
+    
+    Args:
+        service: The service dict containing host_ip and port
+        idx: Optional device index for error reporting
+    
+    Returns:
+        Tuple of (success, JSON dict or None)
+    """
+    url = f"http://{service['host_ip']}:{service['port']}/json/info"
+    prefix = f"{idx}. " if idx is not None else "  "
+    try:
+        response = requests.get(url, timeout=2)
+        if response.status_code == 200:
+            return True, response.json()
+        else:
+            print(f"{prefix}{service['friendly_name']}: Failed (HTTP {response.status_code})")
+            return False, None
+    except Exception as e:
+        print(f"{prefix}{service['friendly_name']}: Error - {e}")
         return False, None
 
 
@@ -308,53 +340,99 @@ def get_nested_field(data, field_path):
     return current
 
 
+def display_json_data(idx, service, data, fields_str):
+    """
+    Display JSON data with optional field filtering and compact formatting.
+    
+    Args:
+        idx: Device index
+        service: Service dictionary
+        data: JSON data to display
+        fields_str: Comma-separated field list or None for full JSON
+    """
+    import json
+    
+    # Parse field list if provided
+    fields = None
+    if fields_str:
+        fields = [f.strip() for f in fields_str.split(',')]
+    
+    if fields:
+        # Display only requested fields
+        # Check if we can fit everything on one line
+        field_values = []
+        for field in fields:
+            value = get_nested_field(data, field)
+            field_values.append((field, value))
+        
+        # If single field or all simple values, use compact format
+        all_simple = all(not isinstance(v, (dict, list)) for _, v in field_values)
+        if all_simple:
+            # Single line format: idx. name: field1=value1, field2=value2
+            value_strs = [f"{field}={json.dumps(value)}" for field, value in field_values]
+            print(f"{idx}. {service['friendly_name']}: {', '.join(value_strs)}")
+        else:
+            # Multi-line format for complex values
+            print(f"{idx}. {service['friendly_name']}:")
+            for field, value in field_values:
+                print(f"  {field}: {json.dumps(value)}")
+    else:
+        # Display full JSON with header
+        print(f"{idx}. {service['friendly_name']}:")
+        print(json.dumps(data, indent=2))
+
+
 @retry_request
-def set_power(service, state):
+def set_power(service, state, idx=None):
     """
     Turn a WLED device on or off and update cached state.
     
     Args:
         service: The service dict containing host_ip and port
         state: True for on, False for off
+        idx: Optional device index for error reporting
     """
     url = f"http://{service['host_ip']}:{service['port']}/json/state"
+    prefix = f"{idx}. " if idx is not None else "  "
     try:
         response = requests.post(url, json={"on": state}, timeout=2)
         if response.status_code == 200:
             service['power_state'] = state  # Update cache
             status = "ON" if state else "OFF"
-            print(f"  {service['friendly_name']}: {status}")
+            print(f"{prefix}{service['friendly_name']}: {status}")
             return True, True
         else:
-            print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
+            print(f"{prefix}{service['friendly_name']}: Failed (HTTP {response.status_code})")
             return False, False
     except Exception as e:
-        print(f"  {service['friendly_name']}: Error - {e}")
+        print(f"{prefix}{service['friendly_name']}: Error - {e}")
         return False, False
 
 
 @retry_request
-def reboot_device(service):
+def reboot_device(service, idx=None):
     """
     Reboot a WLED device.
     
     Args:
         service: The service dict containing host_ip and port
+        idx: Optional device index for error reporting
     
     API Reference: https://kno.wled.ge/interfaces/json-api/
     rb: Reboot the device
     """
     url = f"http://{service['host_ip']}:{service['port']}/json/state"
+    prefix = f"{idx}. " if idx is not None else "  "
     try:
         response = requests.post(url, json={"rb": True}, timeout=2)
         if response.status_code == 200:
-            print(f"  {service['friendly_name']}: Rebooting")
+            print(f"{prefix}{service['friendly_name']}: Rebooting")
             return True, True
         else:
-            print(f"  {service['friendly_name']}: Failed (HTTP {response.status_code})")
+            print(f"{prefix}{service['friendly_name']}: Failed (HTTP {response.status_code})")
             return False, False
     except Exception as e:
-        print(f"  {service['friendly_name']}: Error - {e}")
+        print(f"{prefix}{service['friendly_name']}: Error - {e}")
         return False, False
 
 
@@ -524,11 +602,16 @@ def command_loop():
                 print("Device Management:")
                 print("  id <range>       : Identify devices one-by-one")
                 print("                     (n=next, p=prev, e=exit)")
-                print("  status <range>   : Refresh power state display")
-                print("  info <range> [fields]")
-                print("                   : Get and display JSON status")
+                print("  power <range>    : Refresh power state display")
+                print("  state <range> [fields]")
+                print("                   : Get and display device state (JSON)")
                 print("                     Optional fields: CSV list with dot/bracket notation")
-                print("                     Example: info 0 on,bri,seg[0].bri,udpn.send")
+                print("                     Example: state 0 on,bri,seg[0].bri,udpn.send")
+                print("  info <range> [fields]")
+                print("                   : Get and display device info (JSON)")
+                print("                     Includes WiFi status, version, etc.")
+                print("                     Optional fields: CSV list with dot/bracket notation")
+                print("                     Example: info 0 wifi.rssi,ver,name")
                 print("  group <range> <groupid>")
                 print("                   : Assign devices to a group")
                 print("                     Devices not in range with same groupid -> _default")
@@ -597,7 +680,7 @@ def command_loop():
                 
                 state = (cmd == 'on')
                 for idx in indices:
-                    set_power(services_list[idx], state)
+                    set_power(services_list[idx], state, idx)
                 
                 clear_screen()
                 display_services(services_list)
@@ -618,7 +701,7 @@ def command_loop():
                 
                 print("Rebooting devices...")
                 for idx in indices:
-                    reboot_device(services_list[idx])
+                    reboot_device(services_list[idx], idx)
                 
                 print("Note: Devices will be offline for ~10 seconds during reboot.")
             
@@ -669,7 +752,7 @@ def command_loop():
                 
                 enabled = (on_off == 'on')
                 for idx in indices:
-                    set_sync_enabled(services_list[idx], enabled)
+                    set_sync_enabled(services_list[idx], enabled, idx)
                 
                 clear_screen()
                 display_services(services_list)
@@ -712,14 +795,14 @@ def command_loop():
                     continue
                 
                 for idx in indices:
-                    set_sync_groups(services_list[idx], send_mask, recv_mask)
+                    set_sync_groups(services_list[idx], send_mask, recv_mask, idx)
                 
                 clear_screen()
                 display_services(services_list)
             
-            elif cmd == 'status':
+            elif cmd == 'power':
                 if len(parts) < 2:
-                    print("Usage: status <nn>[-<mm>]")
+                    print("Usage: power <nn>[-<mm>]")
                     continue
                 
                 if not services_list:
@@ -734,17 +817,43 @@ def command_loop():
                 # Refresh power state from devices
                 for idx in indices:
                     service = services_list[idx]
-                    success, status = get_status(service)
+                    success, status = get_status(service, idx)
                     if success and status:
                         service['power_state'] = status.get('on', None)
                 
                 clear_screen()
                 display_services(services_list)
             
+            elif cmd == 'state':
+                if len(parts) < 2:
+                    print("Usage: state <nn>[-<mm>] [fields]")
+                    print("Example: state 0 on,bri,udpn.send")
+                    continue
+                
+                if not services_list:
+                    print("No devices found. Run 'scan' first.")
+                    continue
+                
+                # Parse: state <range> [fields]
+                info_parts = parts[1].split(maxsplit=1)
+                range_spec = info_parts[0]
+                fields_str = info_parts[1] if len(info_parts) > 1 else None
+                
+                indices = parse_range(range_spec, len(services_list), services_list)
+                if indices is None:
+                    print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
+                    continue
+                
+                for idx in indices:
+                    service = services_list[idx]
+                    success, status = get_status(service, idx)
+                    if success and status:
+                        display_json_data(idx, service, status, fields_str)
+            
             elif cmd == 'info':
                 if len(parts) < 2:
                     print("Usage: info <nn>[-<mm>] [fields]")
-                    print("Example: info 0 on,bri,udpn.send")
+                    print("Example: info 0 wifi.rssi,ver,name")
                     continue
                 
                 if not services_list:
@@ -761,40 +870,11 @@ def command_loop():
                     print(f"Invalid range or group. Valid indices: 0-{len(services_list)-1}")
                     continue
                 
-                import json
-                
-                # Parse field list if provided
-                fields = None
-                if fields_str:
-                    fields = [f.strip() for f in fields_str.split(',')]
-                
                 for idx in indices:
                     service = services_list[idx]
-                    success, status = get_status(service)
-                    if success and status:
-                        if fields:
-                            # Display only requested fields
-                            # Check if we can fit everything on one line
-                            field_values = []
-                            for field in fields:
-                                value = get_nested_field(status, field)
-                                field_values.append((field, value))
-                            
-                            # If single field or all simple values, use compact format
-                            all_simple = all(not isinstance(v, (dict, list)) for _, v in field_values)
-                            if all_simple:
-                                # Single line format: idx. name: field1=value1, field2=value2
-                                value_strs = [f"{field}={json.dumps(value)}" for field, value in field_values]
-                                print(f"{idx}. {service['friendly_name']}: {', '.join(value_strs)}")
-                            else:
-                                # Multi-line format for complex values
-                                print(f"{idx}. {service['friendly_name']}:")
-                                for field, value in field_values:
-                                    print(f"  {field}: {json.dumps(value)}")
-                        else:
-                            # Display full JSON with header
-                            print(f"{idx}. {service['friendly_name']}:")
-                            print(json.dumps(status, indent=2))
+                    success, info_data = get_info(service, idx)
+                    if success and info_data:
+                        display_json_data(idx, service, info_data, fields_str)
             
             elif cmd == 'group':
                 if len(parts) < 2:
