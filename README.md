@@ -1,6 +1,6 @@
 # WLED Browser
 
-A powerful command-line interface for managing multiple WLED devices on your network.
+A powerful command-line interface for managing multiple WLED devices on your network.  It leverages WLED's registration of its instances with mDNS, and its provision of JSON HTTP interfaces for control and monitoring. 
 
 ## Features
 
